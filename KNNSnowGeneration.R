@@ -60,7 +60,7 @@ if (TRUE){
   
   
   ## OUTPUT ----
-  output_case <- file.path(output_dir, "3. KNN_Snow_Generation")
+  output_case <- file.path(output_dir, "2. KNN_Snow_Generation")
   if (!dir.exists(output_case)) {
     dir.create(output_case, recursive = TRUE)
   }
@@ -377,7 +377,7 @@ if (TRUE){
   
   ## PARAMETERS ----
   site <- site
-  WATER_YEAR <- 2022  
+  WATER_YEAR <- 2013  
   
   WY_LABEL   <- sprintf("%d-%d", WATER_YEAR, WATER_YEAR + 1)
   START_DATE <- as.Date(sprintf("%d-10-01", WATER_YEAR))
@@ -392,21 +392,24 @@ if (TRUE){
   fSCA_file    <- file.path(KNN_case, "THE.fSCA.csv")
   Fluxalp_file <- file.path(KNN_case, "FLUXALP.daily.csv")
   
-  gen_case      <- file.path(output_dir, "3. KNN_Snow_Generation")
+  gen_case      <- file.path(output_dir, "2. KNN_Snow_Generation")
   equation_case <- file.path(gen_case, "equation_parameters")
   parameters_equation <- file.path(equation_case, paste0("Equation_parameters_", site, ".csv"))
   
   ## OUTPUT ----
-  output_case <- file.path(gen_case, paste0("WY", WY_LABEL))
+  output_case <- file.path(gen_case, "Daily_Snow_Cover")
   if (!dir.exists(output_case)) dir.create(output_case, recursive = TRUE)
   
+  output_site_case <- file.path(output_case, paste0(site))
+  if (!dir.exists(output_site_case)) dir.create(output_site_case, recursive = TRUE)
+  
   output_stack_file <- file.path(
-    output_case,
+    output_site_case,
     paste0("SCA_KNN_", site, "_WY", WY_LABEL, "_", date_tag, ".tif")
   )
   
   output_meta_file <- file.path(
-    output_case,
+    output_site_case,
     paste0("SCA_KNN_", site, "_WY", WY_LABEL, "_", date_tag, "_meta.csv")
   )
   
@@ -575,42 +578,26 @@ if (TRUE){
   
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #### 3. Génération of dayly snow cover for visualisation ####
 #-----------------------------------------------------------#
 if (TRUE){
+  # Description :
+  # This block prepares a daily snow-cover visualisation for a given site and water year.
+  # It loads required packages and mapping functions, defines the water-year and the target
+  # visualisation window, and builds consistent input/output file paths for the stacked SCA
+  # raster, its metadata, and an optional hillshade background.
+  # The final PDF is produced by a single call to `create_daily_snow_pdf()`, which reads the
+  # stack and metadata, filters the requested dates, optionally prepares/caches a 5 m hillshade
+  # background (FAST option available), and writes one clean map + vertical snow-fraction gauge
+  # per day into the output PDF.
   
   ## Packages ----
   library(terra)
+  source(file.path(functions_dir , "Functions_map.R"))
   
   ## PARAMETERS ----
   site <- site
-  WATER_YEAR <- 2022
+  WATER_YEAR <- 2013
   
   WY_LABEL   <- sprintf("%d-%d", WATER_YEAR, WATER_YEAR + 1)
   START_DATE <- as.Date(sprintf("%d-10-01", WATER_YEAR))
@@ -622,9 +609,12 @@ if (TRUE){
   START_VIS <- as.Date(sprintf("%d-02-01", WATER_YEAR + 1))
   END_VIS   <- as.Date(sprintf("%d-07-30", WATER_YEAR + 1))
   
+  # Basemap-style option (same spirit as your create_basemap workflow)
+  FAST <- FALSE
+  
   ## INPUT ----
-  gen_case   <- file.path(output_dir, "3. KNN_Snow_Generation")
-  input_case <- file.path(gen_case, paste0("WY", WY_LABEL))
+  gen_case   <- file.path(output_dir, "2. KNN_Snow_Generation")
+  input_case <- file.path(output_case, paste0(site))
   
   input_stack_file <- file.path(
     input_case,
@@ -636,149 +626,40 @@ if (TRUE){
     paste0("SCA_KNN_", site, "_WY", WY_LABEL, "_", date_tag, "_meta.csv")
   )
   
+  map_case <- file.path(inputs_dir, "map")
+  if (!dir.exists(map_case)) dir.create(map_case, recursive = TRUE)
+  
+  hill_file <- file.path(map_case, paste0("Hill_1_", site, ".tif"))
+  
   ## OUTPUT ----
   output_pdf_file <- file.path(
     input_case,
-    paste0("SCA_daily_", site, "_WY", WY_LABEL, "_",
-           format(START_VIS, "%Y%m%d"), "_", format(END_VIS, "%Y%m%d"), ".pdf")
+    paste0(
+      "SCA_KNN_", site, "_WY", WY_LABEL, "_",
+      format(START_VIS, "%Y%m%d"), "_", format(END_VIS, "%Y%m%d"), ".pdf"
+    )
   )
   
-  ## ---- Read data ----
-  stack_r <- terra::rast(input_stack_file)
   
-  if (file.exists(input_meta_file)) {
-    meta <- read.csv(input_meta_file)
-    meta$DATE <- as.Date(meta$DATE)
-  } else {
-    # fallback if meta missing
-    layer_names <- names(stack_r)
-    dates_txt <- sub("(_obs|_knn)$", "", layer_names)
-    meta <- data.frame(
-      DATE = as.Date(dates_txt, format = "%Y%m%d"),
-      layer = layer_names,
-      source = ifelse(grepl("_obs$", layer_names), "observed", "reconstructed"),
-      WATER_YEAR = WY_LABEL
-    )
-  }
+  ## CODE ----
   
-  ## ---- Filter dates ----
-  meta_vis <- meta[meta$DATE >= START_VIS & meta$DATE <= END_VIS, ]
-  if (nrow(meta_vis) == 0) stop("No layers found in the requested date window.")
-  
-  meta_vis <- meta_vis[order(meta_vis$DATE), ]
-  
-  ## ---- Helpers ----
-  snow_fraction_pct <- function(r){
-    m <- terra::global(r, "mean", na.rm = TRUE)[1,1]
-    as.numeric(m) * 100
-  }
-  
-  draw_binary_map <- function(r, is_obs, date_txt){
-    
-    # clean palette
-    col_nosnow <- "#F5F6F7"
-    col_snow   <- "#2C7FB8"
-    
-    terra::plot(r,
-                col = c(col_nosnow, col_snow),
-                legend = FALSE,
-                axes = FALSE,
-                mar = 0)
-    
-    # soft thin border + highlight if observed
-    box(col = if (is_obs) "#D7191C" else "#444444", lwd = if (is_obs) 3 else 1.5)
-    
-    # title inside left panel
-    mtext(date_txt, side = 3, line = -1.2, adj = 0.02, cex = 1.2, font = 2)
-    
-    # small clean legend
-    legend("topright",
-           legend = c("No snow", "Snow"),
-           fill = c(col_nosnow, col_snow),
-           border = NA,
-           bty = "n",
-           cex = 0.95)
-  }
-  
-  draw_fraction_bar <- function(frac){
-    
-    # canvas
-    plot(NA, xlim = c(0,100), ylim = c(0,1),
-         xlab = "Snow-covered area (%)",
-         ylab = "",
-         yaxt = "n",
-         bty = "n",
-         cex.lab = 1.05,
-         cex.axis = 1.0)
-    
-    # background bar
-    rect(0, 0.25, 100, 0.75, col = "#EEF1F4", border = "#D0D6DC", lwd = 1)
-    
-    # filled bar
-    rect(0, 0.25, frac, 0.75, col = "#2C7FB8", border = NA)
-    
-    # ticks
-    axis(1, at = seq(0,100,20))
-    
-    # label value
-    text(frac, 0.5, labels = sprintf("%.1f%%", frac),
-         pos = 4, cex = 1.2, font = 2, col = "#1B1B1B")
-    
-    title("Daily snow fraction", cex.main = 1.25, font.main = 2)
-  }
-  
-  ## ---- PDF ----
-  pdf(output_pdf_file, width = 11.5, height = 6)
-  
-  for (k in seq_len(nrow(meta_vis))) {
-    
-    lay_name <- meta_vis$layer[k]
-    d        <- meta_vis$DATE[k]
-    src      <- meta_vis$source[k]
-    is_obs   <- src == "observed"
-    
-    r <- stack_r[[lay_name]]
-    frac <- snow_fraction_pct(r)
-    
-    # stable layout
-    par(
-      mfrow = c(1,2),
-      mar = c(3, 3, 3, 2),
-      oma = c(0, 0, 2.5, 0),
-      bg = "white"
-    )
-    
-    # LEFT : map
-    draw_binary_map(r, is_obs, format(d, "%Y-%m-%d"))
-    
-    # RIGHT : fraction bar
-    draw_fraction_bar(frac)
-    
-    # global header
-    mtext(
-      if (is_obs) "OBSERVED (satellite)" else "RECONSTRUCTED (KNN)",
-      side = 3, outer = TRUE, line = 0.3,
-      cex = 1.1, font = 2,
-      col = if (is_obs) "#D7191C" else "#2C7FB8"
-    )
-  }
-  
-  dev.off()
-  
-  cat("PDF written to:\n", output_pdf_file, "\n")
-}
+  create_daily_snow_pdf(
+    input_stack_file = input_stack_file,
+    input_meta_file  = input_meta_file,
+    hill_file        = hill_file,
+    map_case         = map_case,
+    output_pdf_file  = output_pdf_file,
+    START_VIS        = START_VIS,
+    END_VIS          = END_VIS,
+    WY_LABEL         = WY_LABEL,
+    FAST             = FAST,
+    HILL_TARGET_RES  = 5
+  )
 
   
   
   
-  
-  
-  
-  
-  
-  
-  
-  
+}
   
   
   
