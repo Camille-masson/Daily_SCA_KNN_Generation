@@ -1,0 +1,36 @@
+## ---- R / RStudio ----
+.Rhistory
+.RData
+.Rproj.user/
+*.Ruserdata
+.RDataTmp
+.RDataTmp*
+*.RDataTmp
+
+## ---- OS ----
+.DS_Store
+Thumbs.db
+
+## ---- Heavy data folders (do not version) ----
+/inputs/
+/downloads/
+/outputs/
+
+## ---- Optional: ignore large raster/data files anywhere ----
+*.tif
+*.img
+
+
+## ---- Keep code folders tracked ----
+!/functions/
+!/config.R
+!*.R
+If you also use renv, you can append this:
+
+gitignore
+Copier le code
+## ---- renv (optional) ----
+.renv/
+renv/library/
+renv/staging/
+!renv.lock
