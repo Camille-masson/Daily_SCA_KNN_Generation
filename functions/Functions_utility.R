@@ -170,56 +170,32 @@ download_hydroweb_snow <- function(
 
 
 
-
-#------------------------------------------------------------------------------#
-################################################################################
-#------------------------------------------------------------------------------#
-mosaic_crop_stack_snow_binary <- function(
+mosaic_crop_save_snow_binary_daily <- function(
     raw_dir,
     AOI_file,
-    START_DATE,
-    END_DATE,
-    output_file,
-    verbose = TRUE
+    YEAR,
+    output_dir,
+    STUDY_AREA,
+    cloud_thr = 5,     # % max de cloud (205) accepté
+    snow_thr  = 70,    # seuil FSC -> neige
+    verbose   = TRUE
 ) {
   
-  ### Description:
-  # mosaic_crop_stack_snow_binary()
-  # This function post-processes raw Theia Sentinel-2 Snow Cover (L2B) FSC tiles
-  # downloaded from hydroweb.next. For a given AOI shapefile and time range:
-  #   1) It selects FSC GeoTIFFs in raw_dir, filters them by acquisition date
-  #      (START_DATE–END_DATE) and by spatial overlap with the AOI.
-  #   2) Files are grouped by UTC day so that only one output layer is produced per day.
-  #   3) For each day, all intersecting tiles are aligned on a common native grid,
-  #      then mosaicked pixel-wise using priority rules:
-  #        - cloud (205) dominates,
-  #        - otherwise the highest FSC value (0–100) is kept,
-  #        - 255 (NoData) is kept only when no valid data exists.
-  #   4) The daily mosaic is cropped/masked to the AOI; days fully 255 over the AOI
-  #      are skipped to avoid useless layers.
-  #   5) FSC is binarized (<70→0, 70–100→1) while keeping 205 and 255 unchanged.
-  #   6) Each daily layer is reprojected to EPSG:2154 (nearest neighbour),
-  #      aligned to a common 2154 grid, stacked into a time series, and saved to output_file.
   
-  ## Check required packages ----
-  stopifnot(requireNamespace("terra", quietly = TRUE))
-  stopifnot(requireNamespace("fs", quietly = TRUE))
-  stopifnot(requireNamespace("stringr", quietly = TRUE))
-  library(terra)
-  library(fs)
-  library(stringr)
+  START_DATE <- sprintf("%d-01-01T00:00:00", YEAR)
+  END_DATE   <- sprintf("%d-12-31T23:59:59", YEAR)
   
-  ## Validate input parameters ----
-  if (!file.exists(AOI_file)) stop("AOI_file not found.")
   start_dt <- as.POSIXct(START_DATE, tz = "UTC")
   end_dt   <- as.POSIXct(END_DATE,   tz = "UTC")
-  if (is.na(start_dt) || is.na(end_dt)) stop("Invalid START_DATE / END_DATE (ISO UTC expected)")
-  aoi <- terra::vect(AOI_file)
-  if (is.na(terra::crs(aoi))) stop("AOI shapefile has no CRS")
   
-  ## List FSC files ----
-  # List all raw files in raw_dir, then keep only FSC GeoTIFFs
-  # (exclude QCFLAGS and XML/other formats). Stop if none are found.
+  aoi <- terra::vect(AOI_file)
+  
+  # ---- OUTPUT folders (dans output_dir / 1. Snow_cover_by_site / STUDY_AREA / YYYY) ----
+  safe_name <- function(x) gsub("[^A-Za-z0-9_-]+", "_", x)
+  site_tag <- safe_name(STUDY_AREA)
+  
+  
+  # ---- List FSC files ----
   f_all <- fs::dir_ls(raw_dir, recurse = FALSE, type = "file")
   f_fsc <- f_all[
     str_detect(basename(f_all), "FSC") &
@@ -228,9 +204,7 @@ mosaic_crop_stack_snow_binary <- function(
   ]
   if (length(f_fsc) == 0) stop("No FSC tif found in raw_dir.")
   
-  ## Extract acquisition timestamps ----
-  # Extract Sentinel-2 acquisition timestamps (YYYYMMDDTHHMMSS) from filenames,
-  # drop files without a valid timestamp, then convert to UTC datetimes for filtering/grouping.
+  # ---- Extract timestamps ----
   get_stamp <- function(x) str_extract(basename(x), "\\d{8}T\\d{6}")
   stamps <- vapply(f_fsc, get_stamp, character(1))
   ok <- !is.na(stamps)
@@ -239,66 +213,40 @@ mosaic_crop_stack_snow_binary <- function(
   
   dt <- as.POSIXct(stamps, format = "%Y%m%dT%H%M%S", tz = "UTC")
   
-  ## Temporal filter ----
-  # Keep only FSC files whose acquisition datetime falls within START_DATE–END_DATE; stop if none remain.
+  # ---- Temporal filter ----
   keep_time <- dt >= start_dt & dt <= end_dt
   f_fsc <- f_fsc[keep_time]
   dt    <- dt[keep_time]
   if (length(f_fsc) == 0) stop("No FSC files within the requested time range.")
   
-  ## Spatial filter (quick) ----
-  # Quick spatial pre-filter: keep only FSC tiles whose extent overlaps the AOI
-  # (after reprojecting AOI to each tile CRS), and stop if none intersect.
+  # ---- Spatial prefilter ----
   keep_space <- logical(length(f_fsc))
   for (i in seq_along(f_fsc)) {
     r_meta <- terra::rast(f_fsc[i])
     aoi_r  <- terra::project(aoi, terra::crs(r_meta))
-    inter  <- terra::intersect(terra::ext(r_meta), terra::ext(aoi_r))
-    keep_space[i] <- !is.null(inter)
+    keep_space[i] <- !is.null(terra::intersect(terra::ext(r_meta), terra::ext(aoi_r)))
   }
   f_fsc <- f_fsc[keep_space]
   dt    <- dt[keep_space]
   if (length(f_fsc) == 0) stop("No FSC tiles intersecting the AOI.")
   
-  ## Prepare inputs for daily mosaics ----
-  # Group FSC files by UTC day so there is only one mosaic/stack layer per day.
-  # Create a temporary folder to store daily processed rasters before stacking,
-  # and initialize trackers (kept days, temp files, and a 2154 template grid).
-  # Define pixel-wise mosaic rules: 205 (cloud) dominates, else max of 0–100 wins,
-  # and 255 is kept only when no valid data is available.
+  # ---- Group by UTC day ----
   day_tag <- format(dt, "%Y%m%d")
   files_by_day <- split(f_fsc, day_tag)
   days_unique <- names(files_by_day)
   
-  
-  tmp_dir <- file.path(dirname(output_file), "tmp_layers")
-  fs::dir_create(tmp_dir)
-  on.exit(fs::dir_delete(tmp_dir), add = TRUE)
-  
-  tmp_layers <- character(0)
-  kept_days  <- character(0)
-  template_2154 <- NULL
-  
-  ## Rules for mosaic
+  # ---- Mosaic rules ----
   mosaic_rules <- function(v) {
-    if (all(is.na(v))) return(255)
-    if (any(v == 205, na.rm = TRUE)) return(205)
+    if (all(is.na(v))) return(NA)
+    if (any(v == 205, na.rm = TRUE)) return(205)   # cloud dominates
     vv <- v[v >= 0 & v <= 100]
     if (length(vv) > 0) return(max(vv))
-    return(255)
+    return(255)                                    # nodata code
   }
   
-  ## Process each DAY ----
-  # Loop over each UTC day to build one final layer per day:
-  # - read daily FSC tiles safely
-  # - choose first tile as reference, reproject AOI to its CRS
-  # - create an AOI-aligned reference grid (template)
-  # - reproject/crop/resample/mask each tile to the same grid (skip non-overlapping tiles)
-  # - apply custom pixel-wise mosaic rules (205 > max 0–100 > 255)
-  # - skip the day if AOI is fully 255 (NoData)
-  # - binarize FSC (<70=0, 70–100=1, keep 205 & 255)
-  # - reproject to EPSG:2154 and resample to a common 2154 template for stacking
-  # - write the daily result as a temporary layer for the final stack
+  template_2154 <- NULL
+  n_saved <- 0L
+  
   for (d in days_unique) {
     
     if (verbose) message("Processing day: ", d, " (", length(files_by_day[[d]]), " tile(s))")
@@ -309,42 +257,35 @@ mosaic_crop_stack_snow_binary <- function(
     ras_list <- Filter(Negate(is.null), ras_list)
     if (length(ras_list) == 0) next
     
-    ## --- REF + AOI in REF CRS ---
-    ref   <- ras_list[[1]]
+    # --- reference tile + AOI in same CRS ---
+    ref <- ras_list[[1]]
     ref_crs <- terra::crs(ref)
     aoi_ref <- terra::project(aoi, ref_crs)
     aoi_bbox <- terra::ext(aoi_ref)
     
-    ## template aligned on ref grid, covering AOI
+    # template aligned to ref grid covering AOI bbox
     template_native <- terra::crop(ref, aoi_bbox, snap = "out")
     
-    ## --- FORCE SAME GRID BEFORE MOSAIC (with overlap check) ---
+    # --- align each tile to native grid over AOI bbox ---
     ras_list <- lapply(ras_list, function(r) {
       
-      # reproject tile to ref CRS if needed
       if (!terra::same.crs(r, ref)) {
         r <- terra::project(r, ref_crs, method = "near")
       }
       
-      # if still no overlap -> skip safely
-      if (is.null(terra::intersect(terra::ext(r), aoi_bbox))) {
-        return(NULL)
-      }
+      if (is.null(terra::intersect(terra::ext(r), aoi_bbox))) return(NULL)
       
-      # crop/resample/mask on ref grid
       r2 <- terra::crop(r, aoi_bbox, snap = "out")
       r2 <- terra::resample(r2, template_native, method = "near")
-      
       r2
     })
-    
     ras_list <- Filter(Negate(is.null), ras_list)
     if (length(ras_list) == 0) {
       if (verbose) message(" -> skipped (no tile overlaps AOI after alignment).")
       next
     }
     
-    ## Mosaic per day with rules ----
+    # --- mosaic ---
     mos <- if (length(ras_list) == 1) {
       ras_list[[1]]
     } else {
@@ -352,58 +293,75 @@ mosaic_crop_stack_snow_binary <- function(
       terra::app(r_stack, mosaic_rules)
     }
     
-    mos[is.na(mos)] <- 255
+    # --- IMPORTANT: crop + mask AOI (sinon tu calcules sur la bbox, pas sur l’AOI) ---
+    mos <- terra::crop(mos, aoi_bbox, snap = "out")
+    mos <- terra::mask(mos, aoi_ref)
     
-    ## Skip day if AOI is 100% NoData ----
+    # --- AOI checks (NoData + cloud%) ---
     vals <- terra::values(mos, mat = FALSE)
     vals <- vals[!is.na(vals)]
+    
     if (length(vals) == 0 || all(vals == 255)) {
       if (verbose) message(" -> skipped (AOI is 100% NoData for this day).")
       next
     }
     
-    ## Binarize FSC (keep 205 & 255) ----
+    vals_valid <- vals[vals != 255]
+    if (length(vals_valid) == 0) {
+      if (verbose) message(" -> skipped (AOI has no valid pixels for this day).")
+      next
+    }
+    
+    cloud_pct <- 100 * sum(vals_valid == 205) / length(vals_valid)
+    if (cloud_pct > cloud_thr) {
+      if (verbose) message(sprintf(" -> skipped (AOI cloud cover = %.2f%% > %.2f%%).", cloud_pct, cloud_thr))
+      next
+    }
+    
+    # --- binarize (keep cloud 205; keep nodata 255) ---
     mos_bin <- mos
-    mos_bin[mos < 70] <- 0
-    mos_bin[mos >= 70 & mos <= 100] <- 1
-    mos_bin[is.na(mos_bin)] <- 255
+    mos_bin[mos <  snow_thr] <- 0
+    mos_bin[mos >= snow_thr & mos <= 100] <- 1
+    # 205 stays 205; 255 stays 255; outside AOI stays NA
     
-    ## Reproject to EPSG:2154 and align stack grid ----
+    # --- reproject to 2154 + align to common grid ---
     mos_2154 <- terra::project(mos_bin, "EPSG:2154", method = "near")
-    
     if (is.null(template_2154)) {
       template_2154 <- mos_2154
     } else {
       mos_2154 <- terra::resample(mos_2154, template_2154, method = "near")
     }
     
-    ## Write temp layer ----
-    tmp_file <- file.path(tmp_dir, paste0("SNOWBIN_", d, ".tif"))
-    terra::writeRaster(mos_2154, tmp_file, overwrite = TRUE,
-                       wopt = list(datatype = "INT1U"))
+    # --- output folder per CALENDAR YEAR (année classique) ---
+    year_tag <- substr(d, 1, 4)
     
-    tmp_layers <- c(tmp_layers, tmp_file)
-    kept_days  <- c(kept_days, d)
+    
+    out_name <- paste0(site_tag, "_", d, "_SnowCoverBin_2154.tif")
+    out_path <- file.path(output_case, out_name)
+    
+    # (optionnel mais propre) : écrire nodata en 255 via NAflag
+    # on convertit 255 -> NA juste avant écriture, et on dit que NA = 255 dans le GeoTIFF
+    out_r <- mos_2154
+    out_r[out_r == 255] <- NA
+    
+    terra::writeRaster(
+      out_r, out_path, overwrite = TRUE,
+      NAflag = 255,
+      wopt = list(datatype = "INT1U")
+    )
+    
+    n_saved <- n_saved + 1L
+    if (verbose) message(" -> saved: ", normalizePath(out_path))
   }
-  
-  ## Stack and save ----
-  if (length(tmp_layers) == 0) stop("All days were 100% NoData over the AOI. Nothing to stack.")
-  
-  if (verbose) message("Stacking layers...")
-  stack_r <- terra::rast(tmp_layers)
-  names(stack_r) <- kept_days
-  
-  terra::writeRaster(stack_r, output_file, overwrite = TRUE,
-                     wopt = list(datatype = "INT1U"))
   
   if (verbose) {
-    message("Output saved to: ", normalizePath(output_file))
-    message("Layers kept: ", terra::nlyr(stack_r),
-            " / ", length(days_unique))
+    message("Done. Days saved: ", n_saved, " / ", length(days_unique))
+    message("Output folder: ", normalizePath(output_case))
   }
   
-  invisible(output_file)
+  invisible(output_case)
 }
+
 
 
 
